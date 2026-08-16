@@ -1471,16 +1471,33 @@ def create_arrangement_audio_clip(
             "warp": warp,
         })
         lines = [f"Created audio clip from '{file_path}' on track {track_index}"]
-        if isinstance(result, dict):
-            if result.get("file_seconds") is not None:
+
+        # Measure in a SECOND round trip, never in the reply above. Writing
+        # `clip.warping` does not make Live recompute the clip's extent in the
+        # same tick, so anything measured there still describes the warped
+        # import: a 6.000 s file posted with warp=False reported 8.000 s and a
+        # +33.33 % stretch that did not exist. One extra round trip lands on a
+        # later tick and reads the settled extent.
+        measured = None
+        if isinstance(result, dict) and result.get("clip_index") is not None:
+            try:
+                measured = ableton.send_command("measure_arrangement_clip", {
+                    "track_index": ti,
+                    "clip_index": result["clip_index"],
+                })
+            except Exception as e:
+                lines.append(f"  (stretch not measured: {e})")
+
+        if isinstance(measured, dict):
+            if measured.get("file_seconds") is not None:
                 lines.append(
                     "  file {0:.3f}s -> clip {1:.3f}s ({2:+.2f}%), warping={3}".format(
-                        result.get("file_seconds", 0.0),
-                        result.get("clip_seconds", 0.0),
-                        result.get("stretch_percent", 0.0),
-                        result.get("warping")))
-            if result.get("WARNING"):
-                lines.append("  WARNING: " + result["WARNING"])
+                        measured.get("file_seconds", 0.0),
+                        measured.get("clip_seconds", 0.0),
+                        measured.get("stretch_percent", 0.0),
+                        measured.get("warping")))
+            if measured.get("WARNING"):
+                lines.append("  WARNING: " + measured["WARNING"])
         return "\n".join(lines) + _ARRANGEMENT_TIP
     except Exception as e:
         logger.error(f"Error creating arrangement audio clip: {str(e)}")

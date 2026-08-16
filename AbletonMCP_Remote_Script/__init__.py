@@ -225,6 +225,13 @@ class AbletonMCP(ControlSurface):
             elif command_type == "get_track_info":
                 track_index = params.get("track_index", 0)
                 response["result"] = self._get_track_info(track_index)
+            elif command_type == "measure_arrangement_clip":
+                # Read-only, and deliberately a *separate* round trip: see
+                # _measure_stretch on why the extent cannot be read in the same
+                # tick that wrote `warping`.
+                ti = params.get("track_index", 0)
+                ci = params.get("clip_index", 0)
+                response["result"] = self._measure_arrangement_clip(ti, ci)
             # Commands that modify Live's state should be scheduled on the main thread
             elif command_type in ["create_midi_track", "set_track_name",
                                  "create_clip", "add_notes_to_clip", "set_clip_name",
@@ -1933,6 +1940,16 @@ class AbletonMCP(ControlSurface):
         `sample_length / sample_rate` is the *decoded* duration, which is the
         one that matters; ffprobe reports the container duration, and for mp3
         the two differ by the decoder padding.
+
+        MUST NOT run in the same tick that wrote `clip.warping`. Measured on
+        12.4.3: `clip.warping = False` is read back as False immediately, but
+        Live only recomputes the clip's extent on the next tick, so
+        `length`, `start_time` and `end_time` all still describe the warped
+        import. A 6.000 s file posted with warp=False then reports 8.000 s,
+        i.e. +33.33 % of stretch that does not exist -- the very lie this
+        function was written to catch, told by the function itself. One extra
+        round trip is enough to clear it (measured: the first re-read already
+        returns the settled 12.000 beats). Hence _measure_arrangement_clip.
         """
         info = {}
         try:
@@ -1956,6 +1973,28 @@ class AbletonMCP(ControlSurface):
             info["stretch_error"] = str(e)
         return info
 
+    def _measure_arrangement_clip(self, track_index, clip_index):
+        """Measure a clip that already exists, in its own round trip.
+
+        The point of being a separate command is the timing, not the data:
+        anything read in the tick that wrote `clip.warping` still describes the
+        warped import (see _measure_stretch). Called right after
+        create_arrangement_audio_clip, this lands on a later tick and therefore
+        on the settled extent.
+        """
+        if track_index < 0 or track_index >= len(self._song.tracks):
+            raise IndexError("Track index out of range")
+        track = self._song.tracks[track_index]
+        clips = list(track.arrangement_clips)
+        if clip_index < 0 or clip_index >= len(clips):
+            raise IndexError("Clip index out of range: track '{0}' has {1} "
+                             "arrangement clip(s)".format(track.name, len(clips)))
+        clip = clips[clip_index]
+        result = self._get_arrangement_clip_info(clip)
+        result["clip_index"] = clip_index
+        result.update(self._measure_stretch(clip))
+        return result
+
     def _create_arrangement_audio_clip(self, track_index, position, file_path,
                                        warp=None):
         """Create audio clip in arrangement from file.
@@ -1963,6 +2002,11 @@ class AbletonMCP(ControlSurface):
         `warp=False` disables warping right after the import, which is what
         montage against picture needs: warping stretches the audio to the grid.
         `warp=None` leaves Live's own default (which is to warp).
+
+        Deliberately does NOT report the stretch: it cannot be measured in this
+        tick (see _measure_stretch). It returns `clip_index` instead, so the
+        caller can measure with `measure_arrangement_clip` on the next round
+        trip. Reporting a number here would mean reporting a false one.
         """
         try:
             if track_index < 0 or track_index >= len(self._song.tracks):
@@ -1972,12 +2016,15 @@ class AbletonMCP(ControlSurface):
             track.create_audio_clip(file_path, position)
             # Find the newly created clip
             result = {"start_time": position, "file_path": file_path, "is_audio": True}
-            for clip in track.arrangement_clips:
+            for index, clip in enumerate(track.arrangement_clips):
                 if abs(clip.start_time - position) < 0.01:
                     if warp is not None:
                         clip.warping = bool(warp)
                     result = self._get_arrangement_clip_info(clip)
-                    result.update(self._measure_stretch(clip))
+                    result["clip_index"] = index
+                    result["stretch_unmeasured"] = (
+                        "Extent is stale in this tick; call "
+                        "measure_arrangement_clip to get the real stretch.")
                     break
             return result
         except Exception as e:
