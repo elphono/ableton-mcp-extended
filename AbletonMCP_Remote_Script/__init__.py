@@ -241,7 +241,9 @@ class AbletonMCP(ControlSurface):
                                  "set_device_parameter", "set_device_enabled",
                                  "delete_device", "navigate_preset",
                                  "delete_track",
-                                 "set_track_volume", "set_track_panning"]:
+                                 "set_track_volume", "set_track_panning",
+                                 "create_audio_track", "create_return_track",
+                                 "set_track_state", "set_send"]:
                 # Use a thread-safe approach with a response queue
                 response_queue = queue.Queue()
                 
@@ -393,6 +395,23 @@ class AbletonMCP(ControlSurface):
                             ci = params.get("chain_index", None)
                             direction = params.get("direction", "current")
                             result = self._navigate_preset(ti, di, ci, direction)
+                        elif command_type == "create_audio_track":
+                            index = params.get("index", -1)
+                            result = self._create_audio_track(index)
+                        elif command_type == "create_return_track":
+                            result = self._create_return_track()
+                        elif command_type == "set_track_state":
+                            ti = params.get("track_index", 0)
+                            result = self._set_track_state(
+                                ti,
+                                params.get("mute", None),
+                                params.get("solo", None),
+                                params.get("arm", None))
+                        elif command_type == "set_send":
+                            ti = params.get("track_index", 0)
+                            si = params.get("send_index", 0)
+                            value = params.get("value", 0.0)
+                            result = self._set_send(ti, si, value)
 
                         # Put the result in the queue
                         response_queue.put({"status": "success", "result": result})
@@ -422,6 +441,14 @@ class AbletonMCP(ControlSurface):
             elif command_type == "get_track_volume":
                 ti = params.get("track_index", 0)
                 response["result"] = self._get_track_volume(ti)
+            elif command_type == "get_sends":
+                ti = params.get("track_index", 0)
+                response["result"] = self._get_sends(ti)
+            elif command_type == "get_mixer_info":
+                response["result"] = self._get_mixer_info()
+            elif command_type == "inspect_lom":
+                response["result"] = self._inspect_lom(
+                    params.get("path", ""), params.get("max_items", 200))
             elif command_type == "get_browser_item":
                 uri = params.get("uri", None)
                 path = params.get("path", None)
@@ -742,6 +769,243 @@ class AbletonMCP(ControlSurface):
             }
         except Exception as e:
             self.log_message("Error setting track panning: " + str(e))
+            raise
+
+    # ------------------------------------------------------------------
+    # Extensions maison : pistes audio, mute/solo/arm, sends, master,
+    # introspection du Live Object Model.
+    # ------------------------------------------------------------------
+
+    MASTER_INDEX = -1
+
+    def _resolve_any_track(self, track_index):
+        """Resolve a track index over regular tracks, return tracks and master.
+
+        Convention: 0..n-1 = regular tracks, n..n+r-1 = return tracks,
+        -1 = master track.
+        """
+        if track_index == self.MASTER_INDEX:
+            return self._song.master_track, "master"
+        tracks = list(self._song.tracks)
+        returns = list(self._song.return_tracks)
+        if track_index < 0 or track_index >= len(tracks) + len(returns):
+            raise IndexError(
+                "Track index {0} out of range (0-{1}, or -1 for master)".format(
+                    track_index, len(tracks) + len(returns) - 1))
+        if track_index < len(tracks):
+            return tracks[track_index], "track"
+        return returns[track_index - len(tracks)], "return"
+
+    def _create_audio_track(self, index):
+        """Create a new audio track at the specified index (-1 = append)."""
+        try:
+            self._song.create_audio_track(index)
+            new_track_index = len(self._song.tracks) - 1 if index == -1 else index
+            new_track = self._song.tracks[new_track_index]
+            return {
+                "index": new_track_index,
+                "name": new_track.name,
+                "is_audio_track": True,
+            }
+        except Exception as e:
+            self.log_message("Error creating audio track: " + str(e))
+            raise
+
+    def _create_return_track(self):
+        """Create a new return track (always appended)."""
+        try:
+            self._song.create_return_track()
+            new_index = len(self._song.return_tracks) - 1
+            new_track = self._song.return_tracks[new_index]
+            return {
+                "return_index": new_index,
+                "track_index": len(self._song.tracks) + new_index,
+                "name": new_track.name,
+            }
+        except Exception as e:
+            self.log_message("Error creating return track: " + str(e))
+            raise
+
+    def _set_track_state(self, track_index, mute=None, solo=None, arm=None):
+        """Set mute / solo / arm on a track. Only the given flags are touched."""
+        try:
+            track, kind = self._resolve_any_track(track_index)
+            if mute is not None:
+                # The master track has no mute in Live.
+                if kind == "master":
+                    raise ValueError("The master track cannot be muted")
+                track.mute = bool(mute)
+            if solo is not None:
+                if kind == "master":
+                    raise ValueError("The master track cannot be soloed")
+                track.solo = bool(solo)
+            if arm is not None:
+                if not getattr(track, "can_be_armed", False):
+                    raise ValueError(
+                        "Track '{0}' cannot be armed".format(track.name))
+                track.arm = bool(arm)
+            return {
+                "track_name": track.name,
+                "kind": kind,
+                "mute": getattr(track, "mute", None),
+                "solo": getattr(track, "solo", None),
+                "arm": getattr(track, "arm", None),
+            }
+        except Exception as e:
+            self.log_message("Error setting track state: " + str(e))
+            raise
+
+    def _get_sends(self, track_index):
+        """List the send levels of a track, named after their return track."""
+        try:
+            track, kind = self._resolve_any_track(track_index)
+            if kind == "master":
+                raise ValueError("The master track has no sends")
+            returns = list(self._song.return_tracks)
+            sends = []
+            for send_index, send in enumerate(track.mixer_device.sends):
+                sends.append({
+                    "index": send_index,
+                    "name": returns[send_index].name if send_index < len(returns) else "?",
+                    "value": send.value,
+                    "min": send.min,
+                    "max": send.max,
+                })
+            return {"track_name": track.name, "kind": kind, "sends": sends}
+        except Exception as e:
+            self.log_message("Error getting sends: " + str(e))
+            raise
+
+    def _set_send(self, track_index, send_index, value):
+        """Set one send level of a track (0.0 = off, 1.0 = unity)."""
+        try:
+            track, kind = self._resolve_any_track(track_index)
+            if kind == "master":
+                raise ValueError("The master track has no sends")
+            sends = track.mixer_device.sends
+            if send_index < 0 or send_index >= len(sends):
+                raise IndexError("Send index {0} out of range (0-{1})".format(
+                    send_index, len(sends) - 1))
+            send = sends[send_index]
+            send.value = max(send.min, min(send.max, float(value)))
+            return {
+                "track_name": track.name,
+                "send_index": send_index,
+                "value": send.value,
+            }
+        except Exception as e:
+            self.log_message("Error setting send: " + str(e))
+            raise
+
+    def _get_mixer_info(self):
+        """Full mixer snapshot: every track, return and master in one call."""
+        try:
+            returns = list(self._song.return_tracks)
+            return_names = [r.name for r in returns]
+
+            def describe(track, index, kind):
+                mixer = track.mixer_device
+                info = {
+                    "index": index,
+                    "name": track.name,
+                    "kind": kind,
+                    "volume": mixer.volume.value,
+                    "panning": mixer.panning.value,
+                    "mute": getattr(track, "mute", None),
+                    "solo": getattr(track, "solo", None),
+                    "device_count": len(track.devices),
+                }
+                if kind != "master":
+                    info["sends"] = [
+                        {
+                            "index": i,
+                            "name": return_names[i] if i < len(return_names) else "?",
+                            "value": s.value,
+                        }
+                        for i, s in enumerate(mixer.sends)
+                    ]
+                if kind == "track":
+                    info["is_audio_track"] = track.has_audio_input
+                    info["is_midi_track"] = track.has_midi_input
+                    info["is_group_track"] = bool(getattr(track, "is_foldable", False))
+                return info
+
+            tracks = list(self._song.tracks)
+            result = {
+                "tempo": self._song.tempo,
+                "tracks": [describe(t, i, "track") for i, t in enumerate(tracks)],
+                "returns": [
+                    describe(r, len(tracks) + i, "return")
+                    for i, r in enumerate(returns)
+                ],
+                "master": describe(self._song.master_track, self.MASTER_INDEX, "master"),
+            }
+            return result
+        except Exception as e:
+            self.log_message("Error getting mixer info: " + str(e))
+            raise
+
+    def _inspect_lom(self, path, max_items=200):
+        """Introspect a Live Object Model node at runtime.
+
+        `path` is evaluated against the song, e.g. "tracks[0].arrangement_clips[0]"
+        or "master_track.mixer_device.volume". Returns the readable attributes
+        with their values, so Live's real API can be discovered instead of
+        guessed at -- Live's Python API differs between versions and the docs
+        lag behind.
+        """
+        try:
+            obj = self._song
+            expr = (path or "").strip()
+            if expr:
+                # Only attribute access and integer indexing are allowed: no
+                # call, no arbitrary expression.
+                for token in expr.split("."):
+                    name = token
+                    indices = []
+                    while name.endswith("]"):
+                        head, _, idx = name[:-1].rpartition("[")
+                        indices.insert(0, int(idx))
+                        name = head
+                    if name:
+                        obj = getattr(obj, name)
+                    for idx in indices:
+                        obj = obj[idx]
+
+            attributes = {}
+            methods = []
+            for attr in sorted(dir(obj)):
+                if attr.startswith("_"):
+                    continue
+                try:
+                    value = getattr(obj, attr)
+                except Exception as exc:
+                    attributes[attr] = "<unreadable: {0}>".format(exc)
+                    continue
+                if callable(value):
+                    methods.append(attr)
+                    continue
+                type_name = type(value).__name__
+                if isinstance(value, (bool, int, float, str)):
+                    attributes[attr] = value
+                elif value is None:
+                    attributes[attr] = None
+                else:
+                    try:
+                        attributes[attr] = "<{0}, len={1}>".format(type_name, len(value))
+                    except Exception:
+                        attributes[attr] = "<{0}>".format(type_name)
+                if len(attributes) >= max_items:
+                    break
+
+            return {
+                "path": expr,
+                "type": type(obj).__name__,
+                "attributes": attributes,
+                "methods": methods,
+            }
+        except Exception as e:
+            self.log_message("Error inspecting LOM path '" + str(path) + "': " + str(e))
             raise
 
     def _create_clip(self, track_index, clip_index, length):
@@ -1407,7 +1671,14 @@ class AbletonMCP(ControlSurface):
         """Set a property on an arrangement clip."""
         try:
             ALLOWED = ("name", "muted", "color", "looping", "loop_start", "loop_end",
-                       "gain", "pitch_coarse", "pitch_fine", "warping", "warp_mode")
+                       "gain", "pitch_coarse", "pitch_fine", "warping", "warp_mode",
+                       # Montage : rogner l'extrait joue dans le sample, poser
+                       # les fondus d'entree/sortie, deplacer le clip.
+                       "start_marker", "end_marker", "position",
+                       "fade_in_length", "fade_out_length",
+                       "start_time", "end_time",
+                       "velocity_amount", "signature_numerator",
+                       "signature_denominator")
             if property_name not in ALLOWED:
                 raise ValueError("Property '{0}' not allowed. Allowed: {1}".format(
                     property_name, ", ".join(ALLOWED)))

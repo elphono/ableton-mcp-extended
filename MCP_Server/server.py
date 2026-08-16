@@ -2170,6 +2170,237 @@ def navigate_device_preset(
         return f"Error navigating preset: {str(e)}"
 
 
+# ---------------------------------------------------------------------------
+# Extensions maison : pistes audio, mute/solo/arm, sends, master, introspection.
+#
+# Convention d'index de piste pour ces outils : 1..n = pistes normales,
+# n+1..n+r = pistes de retour, 0 = piste master.
+# ---------------------------------------------------------------------------
+
+
+def _to_remote_track_index(track_index: int, field_name: str = "track_index") -> int:
+    """Convert a 1-based MCP track index to the Remote Script's convention.
+
+    0 means the master track, which the Remote Script addresses as -1.
+    """
+    if track_index < 0:
+        raise ValueError(
+            f"{field_name} must be >= 0 (0 = master, 1+ = 1-based), got {track_index}"
+        )
+    return -1 if track_index == 0 else track_index - 1
+
+
+@mcp.tool()
+def create_audio_track(ctx: Context, index: int = 0) -> str:
+    """Create a new audio track — needed to host samples, loops or recordings.
+
+    Parameters:
+    - index: 1-based position for the new track. 0 (default) appends it at the end.
+    """
+    try:
+        ableton = get_ableton_connection()
+        remote_index = -1 if index == 0 else _to_zero_based(index, "index")
+        result = ableton.send_command("create_audio_track", {"index": remote_index})
+        return (
+            f"Created audio track '{result.get('name', '?')}' "
+            f"at position {result.get('index', 0) + 1}"
+        )
+    except Exception as e:
+        logger.error(f"Error creating audio track: {str(e)}")
+        return f"Error creating audio track: {str(e)}"
+
+
+@mcp.tool()
+def create_return_track(ctx: Context) -> str:
+    """Create a new return track, to host a shared effect (reverb, delay) fed by sends."""
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("create_return_track", {})
+        return (
+            f"Created return track '{result.get('name', '?')}' — "
+            f"address it as track_index {result.get('track_index', 0) + 1}"
+        )
+    except Exception as e:
+        logger.error(f"Error creating return track: {str(e)}")
+        return f"Error creating return track: {str(e)}"
+
+
+@mcp.tool()
+def set_track_state(
+    ctx: Context,
+    track_index: int,
+    mute: bool | None = None,
+    solo: bool | None = None,
+    arm: bool | None = None,
+) -> str:
+    """Mute, solo or arm a track. Only the flags you pass are changed.
+
+    Parameters:
+    - track_index: 1-based track number (0 = master, which cannot be muted or soloed).
+    - mute: True to mute, False to unmute.
+    - solo: True to solo, False to unsolo.
+    - arm: True to record-arm, False to disarm.
+    """
+    try:
+        ableton = get_ableton_connection()
+        params: Dict[str, Any] = {
+            "track_index": _to_remote_track_index(track_index)
+        }
+        if mute is not None:
+            params["mute"] = mute
+        if solo is not None:
+            params["solo"] = solo
+        if arm is not None:
+            params["arm"] = arm
+        if len(params) == 1:
+            return "Nothing to do: pass at least one of mute, solo or arm."
+        result = ableton.send_command("set_track_state", params)
+        return (
+            f"'{result.get('track_name', '?')}': mute={result.get('mute')}, "
+            f"solo={result.get('solo')}, arm={result.get('arm')}"
+        )
+    except Exception as e:
+        logger.error(f"Error setting track state: {str(e)}")
+        return f"Error setting track state: {str(e)}"
+
+
+@mcp.tool()
+def get_sends(ctx: Context, track_index: int) -> str:
+    """List a track's send levels, each named after the return track it feeds.
+
+    Parameters:
+    - track_index: 1-based track number.
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("get_sends", {
+            "track_index": _to_remote_track_index(track_index)
+        })
+        sends = result.get("sends", [])
+        if not sends:
+            return (
+                f"'{result.get('track_name', '?')}' has no sends "
+                "(the set has no return track yet — use create_return_track)."
+            )
+        lines = [f"Sends of '{result.get('track_name', '?')}':"]
+        for send in sends:
+            lines.append(
+                f"  send_index {send['index'] + 1} -> '{send['name']}': {send['value']:.4f}"
+            )
+        return "\n".join(lines)
+    except Exception as e:
+        logger.error(f"Error getting sends: {str(e)}")
+        return f"Error getting sends: {str(e)}"
+
+
+@mcp.tool()
+def set_send(ctx: Context, track_index: int, send_index: int, value: float) -> str:
+    """Set how much of a track is sent to a return track (reverb, delay, ...).
+
+    Parameters:
+    - track_index: 1-based track number.
+    - send_index: 1-based send number, matching the return track order.
+    - value: 0.0 = off, 1.0 = unity. Use get_sends to see the current levels.
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("set_send", {
+            "track_index": _to_remote_track_index(track_index),
+            "send_index": _to_zero_based(send_index, "send_index"),
+            "value": value,
+        })
+        return (
+            f"Set send {send_index} of '{result.get('track_name', '?')}' "
+            f"to {result.get('value', value):.4f}"
+        )
+    except Exception as e:
+        logger.error(f"Error setting send: {str(e)}")
+        return f"Error setting send: {str(e)}"
+
+
+@mcp.tool()
+def get_mixer_info(ctx: Context) -> str:
+    """Full mixer snapshot in one call: every track, return and master.
+
+    Reports volume, panning, mute, solo and send levels. Cheaper and more
+    complete than calling get_track_info track by track.
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("get_mixer_info", {})
+
+        def describe(entry: Dict[str, Any], label: str) -> str:
+            flags = []
+            if entry.get("mute"):
+                flags.append("MUTED")
+            if entry.get("solo"):
+                flags.append("SOLO")
+            sends = entry.get("sends") or []
+            active = [
+                f"{s['name']}={s['value']:.2f}" for s in sends if s["value"] > 0.001
+            ]
+            if active:
+                flags.append("sends: " + ", ".join(active))
+            suffix = f" [{'; '.join(flags)}]" if flags else ""
+            return (
+                f"  {label} '{entry.get('name', '?')}': "
+                f"vol={entry.get('volume', 0):.3f} pan={entry.get('panning', 0):+.2f}"
+                f"{suffix}"
+            )
+
+        lines = [f"Mixer @ {result.get('tempo', 0):.2f} BPM"]
+        tracks = result.get("tracks", [])
+        lines.append(f"Tracks ({len(tracks)}):")
+        for entry in tracks:
+            kind = "audio" if entry.get("is_audio_track") else "midi"
+            if entry.get("is_group_track"):
+                kind = "group"
+            lines.append(describe(entry, f"{entry['index'] + 1}. [{kind}]"))
+        returns = result.get("returns", [])
+        if returns:
+            lines.append(f"Returns ({len(returns)}):")
+            for entry in returns:
+                lines.append(describe(entry, f"{entry['index'] + 1}. [return]"))
+        master = result.get("master")
+        if master:
+            lines.append("Master (track_index 0):")
+            lines.append(describe(master, "0. [master]"))
+        return "\n".join(lines)
+    except Exception as e:
+        logger.error(f"Error getting mixer info: {str(e)}")
+        return f"Error getting mixer info: {str(e)}"
+
+
+@mcp.tool()
+def inspect_lom(ctx: Context, path: str = "") -> str:
+    """Introspect Ableton's Live Object Model at runtime to discover its real API.
+
+    Live's Python API changes between versions and the documentation lags behind,
+    so use this instead of guessing whether a property exists or is writable.
+
+    Parameters:
+    - path: dotted path from the Song object, with integer indexing. Empty = the
+      Song itself. Examples: "tracks[0]", "tracks[0].arrangement_clips[0]",
+      "master_track.mixer_device.volume", "view".
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("inspect_lom", {"path": path})
+        lines = [
+            f"{result.get('type', '?')} at Song.{result.get('path') or '<root>'}",
+            "Properties:",
+        ]
+        for name, value in (result.get("attributes") or {}).items():
+            lines.append(f"  {name} = {value!r}")
+        methods = result.get("methods") or []
+        if methods:
+            lines.append("Methods: " + ", ".join(methods))
+        return "\n".join(lines)
+    except Exception as e:
+        logger.error(f"Error inspecting LOM: {str(e)}")
+        return f"Error inspecting LOM: {str(e)}"
+
+
 # Main execution
 def main():
     """Run the MCP server"""
