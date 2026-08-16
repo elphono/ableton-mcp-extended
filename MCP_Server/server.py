@@ -2372,6 +2372,49 @@ def get_mixer_info(ctx: Context) -> str:
 
 
 @mcp.tool()
+def set_clip_fade(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    fade_in: float = 0.0,
+    fade_out: float = 0.0,
+    parameter_name: str = "Volume",
+) -> str:
+    """Fade an arrangement clip in and/or out — the way to build a transition.
+
+    Live's scripting API exposes no clip fade handles, so this writes an
+    automation envelope instead (track volume by default). To crossfade two
+    extracts, overlap them on two tracks and fade one out while the other
+    fades in.
+
+    Parameters:
+    - track_index: 1-based track number.
+    - clip_index: 1-based arrangement clip number on that track.
+    - fade_in: fade-in duration in beats (0 = none).
+    - fade_out: fade-out duration in beats (0 = none).
+    - parameter_name: parameter to automate. "Volume" by default.
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("set_clip_fade", {
+            "track_index": _to_zero_based(track_index, "track_index"),
+            "clip_index": _to_zero_based(clip_index, "clip_index"),
+            "fade_in": fade_in,
+            "fade_out": fade_out,
+            "parameter_name": parameter_name,
+        })
+        return (
+            f"'{result.get('clip_name', '?')}' on '{result.get('track_name', '?')}': "
+            f"{result.get('parameter', '?')} fades in over {result.get('fade_in', 0):.2f} "
+            f"beats and out over {result.get('fade_out', 0):.2f} beats "
+            f"(clip is {result.get('clip_length', 0):.2f} beats long)"
+        )
+    except Exception as e:
+        logger.error(f"Error setting clip fade: {str(e)}")
+        return f"Error setting clip fade: {str(e)}"
+
+
+@mcp.tool()
 def inspect_lom(ctx: Context, path: str = "") -> str:
     """Introspect Ableton's Live Object Model at runtime to discover its real API.
 

@@ -243,7 +243,7 @@ class AbletonMCP(ControlSurface):
                                  "delete_track",
                                  "set_track_volume", "set_track_panning",
                                  "create_audio_track", "create_return_track",
-                                 "set_track_state", "set_send"]:
+                                 "set_track_state", "set_send", "set_clip_fade"]:
                 # Use a thread-safe approach with a response queue
                 response_queue = queue.Queue()
                 
@@ -412,6 +412,13 @@ class AbletonMCP(ControlSurface):
                             si = params.get("send_index", 0)
                             value = params.get("value", 0.0)
                             result = self._set_send(ti, si, value)
+                        elif command_type == "set_clip_fade":
+                            result = self._set_clip_fade(
+                                params.get("track_index", 0),
+                                params.get("clip_index", 0),
+                                params.get("fade_in", 0.0),
+                                params.get("fade_out", 0.0),
+                                params.get("parameter_name", "Volume"))
 
                         # Put the result in the queue
                         response_queue.put({"status": "success", "result": result})
@@ -778,6 +785,19 @@ class AbletonMCP(ControlSurface):
 
     MASTER_INDEX = -1
 
+    @staticmethod
+    def _safe_get(obj, attr, default=None):
+        """Read an attribute that may exist but raise when read.
+
+        The master track carries `mute` and `solo`, but reading them raises
+        RuntimeError ("Main track has no 'mute' property!"). A plain
+        getattr(..., default) does not catch that, only AttributeError.
+        """
+        try:
+            return getattr(obj, attr)
+        except Exception:
+            return default
+
     def _resolve_any_track(self, track_index):
         """Resolve a track index over regular tracks, return tracks and master.
 
@@ -847,9 +867,9 @@ class AbletonMCP(ControlSurface):
             return {
                 "track_name": track.name,
                 "kind": kind,
-                "mute": getattr(track, "mute", None),
-                "solo": getattr(track, "solo", None),
-                "arm": getattr(track, "arm", None),
+                "mute": self._safe_get(track, "mute"),
+                "solo": self._safe_get(track, "solo"),
+                "arm": self._safe_get(track, "arm"),
             }
         except Exception as e:
             self.log_message("Error setting track state: " + str(e))
@@ -911,8 +931,8 @@ class AbletonMCP(ControlSurface):
                     "kind": kind,
                     "volume": mixer.volume.value,
                     "panning": mixer.panning.value,
-                    "mute": getattr(track, "mute", None),
-                    "solo": getattr(track, "solo", None),
+                    "mute": self._safe_get(track, "mute"),
+                    "solo": self._safe_get(track, "solo"),
                     "device_count": len(track.devices),
                 }
                 if kind != "master":
@@ -943,6 +963,85 @@ class AbletonMCP(ControlSurface):
             return result
         except Exception as e:
             self.log_message("Error getting mixer info: " + str(e))
+            raise
+
+    def _resolve_track_parameter(self, track, parameter_name):
+        """Find a mixer, send or device parameter by name on a track."""
+        mixer = track.mixer_device
+        wanted = (parameter_name or "Volume").lower()
+        for param in (mixer.volume, mixer.panning):
+            if param.name.lower() == wanted:
+                return param
+        for send in mixer.sends:
+            if send.name.lower() == wanted:
+                return send
+        for device in track.devices:
+            for param in device.parameters:
+                if param.name.lower() == wanted:
+                    return param
+        raise ValueError("Parameter '{0}' not found on track '{1}'".format(
+            parameter_name, track.name))
+
+    def _set_clip_fade(self, track_index, clip_index, fade_in=0.0, fade_out=0.0,
+                       parameter_name="Volume"):
+        """Draw a fade in / fade out as an automation envelope on a clip.
+
+        Live's LOM exposes no `fade_in_length` on arrangement clips -- the clip
+        fade handles you can drag in the UI are simply not scriptable. The only
+        way to ramp a clip in or out from a script is to write the automation
+        envelope of a parameter, by default the track volume.
+
+        `fade_in` and `fade_out` are durations in beats.
+        """
+        try:
+            track, clip = self._resolve_arrangement_clip(track_index, clip_index)
+            param = self._resolve_track_parameter(track, parameter_name)
+
+            clip.create_automation_envelope(param)
+            envelope = clip.automation_envelope(param)
+            if envelope is None:
+                raise RuntimeError("Live returned no envelope for " + param.name)
+
+            if not hasattr(envelope, "insert_step"):
+                # Do not guess the API: report what this Live version offers.
+                available = [a for a in dir(envelope) if not a.startswith("_")]
+                raise RuntimeError(
+                    "This Live version's envelope has no insert_step. "
+                    "Available: " + ", ".join(available))
+
+            length = clip.end_marker - clip.start_marker
+            fade_in = max(0.0, min(float(fade_in), length))
+            fade_out = max(0.0, min(float(fade_out), length - fade_in))
+            top = param.max
+            bottom = param.min
+
+            # insert_step(time, length, value) writes a constant segment; a ramp
+            # is approximated by a series of short steps.
+            steps = 32
+            if fade_in > 0:
+                width = fade_in / steps
+                for i in range(steps):
+                    ratio = float(i) / (steps - 1) if steps > 1 else 1.0
+                    envelope.insert_step(i * width, width,
+                                         bottom + (top - bottom) * ratio)
+            if fade_out > 0:
+                width = fade_out / steps
+                start = length - fade_out
+                for i in range(steps):
+                    ratio = 1.0 - (float(i) / (steps - 1) if steps > 1 else 1.0)
+                    envelope.insert_step(start + i * width, width,
+                                         bottom + (top - bottom) * ratio)
+
+            return {
+                "track_name": track.name,
+                "clip_name": clip.name,
+                "parameter": param.name,
+                "fade_in": fade_in,
+                "fade_out": fade_out,
+                "clip_length": length,
+            }
+        except Exception as e:
+            self.log_message("Error setting clip fade: " + str(e))
             raise
 
     def _inspect_lom(self, path, max_items=200):
