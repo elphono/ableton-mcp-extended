@@ -655,12 +655,15 @@ def load_instrument_or_effect(ctx: Context, track_index: int, uri: str) -> str:
         
         # Check if the instrument was loaded successfully
         if result.get("loaded", False):
+            head = (f"Loaded '{result.get('item_name', uri)}' on track "
+                    f"{track_index} ('{result.get('track_name', '?')}')")
             new_devices = result.get("new_devices", [])
             if new_devices:
-                return f"Loaded instrument with URI '{uri}' on track {track_index}. New devices: {', '.join(new_devices)}"
-            else:
-                devices = result.get("devices_after", [])
-                return f"Loaded instrument with URI '{uri}' on track {track_index}. Devices on track: {', '.join(devices)}"
+                return f"{head}. New devices: {', '.join(new_devices)}"
+            devices = result.get("devices_after", [])
+            tail = ", ".join(devices) if devices else "(none reported yet)"
+            note = result.get("note", "")
+            return f"{head}. Devices on track: {tail}" + (f"\n  {note}" if note else "")
         else:
             return f"Failed to load instrument with URI '{uri}'"
     except Exception as e:
@@ -1434,14 +1437,27 @@ def create_arrangement_audio_clip(
     file_path: str,
     start_bar: int = 0,
     start_beat: float = 0.0,
+    warp: bool = None,
 ) -> str:
     """Place an audio file as a clip in the arrangement.
 
+    Live WARPS imported audio by default, which time-stretches it to the grid.
+    Measured on 12.4.3: a 15.085 s file became 16.000 s at 120 BPM, +6.1 %,
+    with nothing in the API saying so. Pass warp=False whenever the audio has
+    to stay at its true speed — anything cut against picture, and any extract
+    whose lip-sync matters. The reply reports the stretch either way.
+
+    A clip cannot be moved afterwards (start_time is read-only), so place it at
+    its final position now.
+
     Parameters:
     - track_index: Track number (1-based).
-    - file_path: Path to the audio file.
+    - file_path: Path to the audio file. A Windows path (E:\\...), never a
+      /home/... or \\\\wsl.localhost\\... path — Live cannot read those.
     - start_bar: Start bar (1-based).
     - start_beat: Start position in beats.
+    - warp: False to play the file at its true speed, True to warp it to the
+      grid, None to leave Live's own default (which warps).
     """
     try:
         ableton = get_ableton_connection()
@@ -1452,8 +1468,20 @@ def create_arrangement_audio_clip(
             "track_index": ti,
             "position": position,
             "file_path": file_path,
+            "warp": warp,
         })
-        return f"Created audio clip from '{file_path}' on track {track_index}" + _ARRANGEMENT_TIP
+        lines = [f"Created audio clip from '{file_path}' on track {track_index}"]
+        if isinstance(result, dict):
+            if result.get("file_seconds") is not None:
+                lines.append(
+                    "  file {0:.3f}s -> clip {1:.3f}s ({2:+.2f}%), warping={3}".format(
+                        result.get("file_seconds", 0.0),
+                        result.get("clip_seconds", 0.0),
+                        result.get("stretch_percent", 0.0),
+                        result.get("warping")))
+            if result.get("WARNING"):
+                lines.append("  WARNING: " + result["WARNING"])
+        return "\n".join(lines) + _ARRANGEMENT_TIP
     except Exception as e:
         logger.error(f"Error creating arrangement audio clip: {str(e)}")
         return f"Error creating arrangement audio clip: {str(e)}"
@@ -1545,6 +1573,20 @@ def set_arrangement_clip_property(
 ) -> str:
     """Set properties on an arrangement clip.
 
+    An arrangement clip CANNOT BE TRIMMED OR MOVED through this API, measured
+    on Live 12.4.3: start_time and end_time have no setter, start_marker is
+    silently reset to 0, end_marker is accepted and read back while changing
+    nothing, and position moves the loop brace inside the sample rather than
+    the clip on the timeline. Cut the extract upstream and import it already
+    the right length, at its final position. To relocate an existing clip,
+    duplicate_clip_to_arrangement to the new spot then delete the original.
+
+    `looping` + `loop_start`/`loop_end` do work, but they LOOP the clip inside
+    its unchanged extent; they do not shorten it.
+
+    Beware two unit traps: clip `gain` is 0.4 at 0.00 dB (not 1.0), and
+    `warping=True` time-stretches the audio to the grid.
+
     Parameters:
     - track_index: Track number (1-based).
     - clip_index: Clip position (1-based).
@@ -1574,21 +1616,34 @@ def set_arrangement_clip_property(
         }
 
         changes = []
+        warnings = []
+        last = None
         for prop_name, value in props.items():
             if value is not None and value != "":
-                ableton.send_command("set_arrangement_clip_property", {
+                last = ableton.send_command("set_arrangement_clip_property", {
                     "track_index": ti,
                     "clip_index": ci,
                     "property": prop_name,
                     "value": value,
                 })
                 changes.append(f"{prop_name}={value}")
+                if isinstance(last, dict) and last.get("WARNING"):
+                    warnings.append(f"  WARNING ({prop_name}): {last['WARNING']}")
 
         if not changes:
             return "No properties specified to change."
 
         ref = f"'{clip_name}'" if clip_name else f"clip {clip_index}"
-        return f"Updated {ref} on track {track_index}: {', '.join(changes)}"
+        lines = [f"Updated {ref} on track {track_index}: {', '.join(changes)}"]
+        if isinstance(last, dict) and last.get("extent_beats") is not None:
+            lines.append(
+                "  clip now spans {0:.3f}-{1:.3f} ({2:.3f} beats), "
+                "loop={3:.3f} looping={4} warping={5}".format(
+                    last.get("start_time", 0.0), last.get("end_time", 0.0),
+                    last.get("extent_beats", 0.0), last.get("loop_length_beats", 0.0),
+                    last.get("looping"), last.get("warping")))
+        lines.extend(warnings)
+        return "\n".join(lines)
     except Exception as e:
         logger.error(f"Error setting arrangement clip property: {str(e)}")
         return f"Error setting arrangement clip property: {str(e)}"
@@ -1642,14 +1697,22 @@ def manage_clip_automation(
     action: str = "create",
     parameter_name: str = "volume",
 ) -> str:
-    """Create or clear automation envelopes on arrangement clips.
+    """Create or clear automation envelopes on SESSION clips.
+
+    This targeted arrangement clips, which made it unusable: they reject every
+    envelope call in Live 12.4.3 with "Not a session clip", so it could never
+    succeed. It now resolves a session clip slot.
+
+    Creating an envelope only makes an EMPTY one — it draws no fade. Use
+    set_clip_fade to actually write a ramp.
 
     Parameters:
     - track_index: Track number (1-based).
-    - clip_index: Clip position (1-based).
-    - clip_name: Clip name (alternative to clip_index).
+    - clip_index: SESSION clip slot (1-based).
+    - clip_name: ignored — session slots are addressed by index.
     - action: "create", "clear", or "clear_all".
-    - parameter_name: Parameter to automate (e.g., "volume", "panning").
+    - parameter_name: Parameter to automate. Live's mixer parameters are named
+      "Track Volume" and "Track Panning"; "volume" and "pan" are accepted.
     """
     try:
         ableton = get_ableton_connection()
@@ -1775,12 +1838,17 @@ def set_device_parameter(
 ) -> str:
     """Set a device parameter value.
 
+    parameter_index=1 is "Device On" on every Live device — parameter 0 of the
+    chain. Setting it turns the device off or on, which is rarely what was
+    meant; address parameters by name and keep get_device_parameters at hand.
+
     Parameters:
     - track_index: Track number (1-based).
     - device_index: Device number (1-based, default 1).
     - chain_index: Chain number inside a rack (1-based, 0 = no chain).
     - parameter_name: Parameter name, friendly alias, or partial match.
     - parameter_index: Parameter number (1-based, alternative to name).
+      1 = "Device On".
     - value: Normalized value 0.0-1.0.
     """
     try:
@@ -2378,21 +2446,27 @@ def set_clip_fade(
     clip_index: int,
     fade_in: float = 0.0,
     fade_out: float = 0.0,
-    parameter_name: str = "Volume",
+    parameter_name: str = "Track Volume",
 ) -> str:
-    """Fade an arrangement clip in and/or out — the way to build a transition.
+    """Ramp a parameter in and/or out across a SESSION clip.
 
-    Live's scripting API exposes no clip fade handles, so this writes an
-    automation envelope instead (track volume by default). To crossfade two
-    extracts, overlap them on two tracks and fade one out while the other
-    fades in.
+    ONLY SESSION CLIPS. Arrangement clips reject every envelope call in Live
+    12.4.3 ("Not a session clip"), and arrangement automation is not writable
+    through the LOM at all. To fade an extract in the arrangement, bake the
+    fade into the audio file before importing it (ffmpeg afade) or draw it by
+    hand in Live — there is no third way.
+
+    The ramp ends at the parameter's current value, not its maximum: Track
+    Volume runs 0.0-1.0 with unity at 0.85, so ramping to max would land a
+    fade-in 6 dB above the level the track was set to.
 
     Parameters:
     - track_index: 1-based track number.
-    - clip_index: 1-based arrangement clip number on that track.
+    - clip_index: 1-based SESSION clip slot on that track.
     - fade_in: fade-in duration in beats (0 = none).
     - fade_out: fade-out duration in beats (0 = none).
-    - parameter_name: parameter to automate. "Volume" by default.
+    - parameter_name: parameter to automate. Live calls the mixer parameters
+      "Track Volume" and "Track Panning"; "volume" and "pan" are accepted.
     """
     try:
         ableton = get_ableton_connection()
@@ -2402,16 +2476,139 @@ def set_clip_fade(
             "fade_in": fade_in,
             "fade_out": fade_out,
             "parameter_name": parameter_name,
+            "session": True,
         })
         return (
             f"'{result.get('clip_name', '?')}' on '{result.get('track_name', '?')}': "
             f"{result.get('parameter', '?')} fades in over {result.get('fade_in', 0):.2f} "
             f"beats and out over {result.get('fade_out', 0):.2f} beats "
-            f"(clip is {result.get('clip_length', 0):.2f} beats long)"
+            f"(clip is {result.get('clip_length', 0):.2f} beats long, "
+            f"ramping to {result.get('ramps_to', 0):.3f})"
         )
     except Exception as e:
         logger.error(f"Error setting clip fade: {str(e)}")
         return f"Error setting clip fade: {str(e)}"
+
+
+@mcp.tool()
+def get_clip_notes(
+    ctx: Context,
+    track_index: int,
+    clip_index: int = 1,
+    arrangement: bool = False,
+) -> str:
+    """Read the MIDI notes of a clip — the other half of add_notes_to_clip.
+
+    Writing notes without being able to read them back is half a loop: use this
+    to check what actually landed, before transposing, fixing or replacing it.
+
+    Times are in beats from the clip start.
+
+    Parameters:
+    - track_index: Track number (1-based).
+    - clip_index: Clip number (1-based). A session slot unless arrangement=True.
+    - arrangement: True to read an arrangement clip instead of a session slot.
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("get_clip_notes", {
+            "track_index": _to_zero_based(track_index, "track_index"),
+            "clip_index": _to_zero_based(clip_index, "clip_index"),
+            "arrangement": arrangement,
+        })
+        notes = result.get("notes", [])
+        lines = [
+            f"'{result.get('clip_name', '?')}' on '{result.get('track_name', '?')}' — "
+            f"{result.get('note_count', 0)} note(s), "
+            f"clip is {result.get('clip_length', 0):.3f} beats"
+        ]
+        for note in notes:
+            extra = ""
+            if note.get("mute"):
+                extra += " MUTED"
+            if note.get("probability") not in (None, 1.0):
+                extra += f" p={note['probability']:.2f}"
+            lines.append(
+                "  beat {0:8.3f}  pitch {1:3d}  dur {2:6.3f}  vel {3:3.0f}{4}".format(
+                    note.get("start_time", 0.0), int(note.get("pitch", 0)),
+                    note.get("duration", 0.0), note.get("velocity", 0.0), extra))
+        return "\n".join(lines)
+    except Exception as e:
+        logger.error(f"Error getting clip notes: {str(e)}")
+        return f"Error getting clip notes: {str(e)}"
+
+
+@mcp.tool()
+def remove_clip_notes(
+    ctx: Context,
+    track_index: int,
+    clip_index: int = 1,
+    from_time: float = 0.0,
+    time_span: float = None,
+    from_pitch: int = 0,
+    pitch_span: int = 128,
+    arrangement: bool = False,
+) -> str:
+    """Delete MIDI notes from a clip, inside a time and pitch window.
+
+    add_notes_to_clip only ever adds, so this is how a part gets corrected:
+    clear, then add again. The defaults clear the whole clip.
+
+    Parameters:
+    - track_index: Track number (1-based).
+    - clip_index: Clip number (1-based). A session slot unless arrangement=True.
+    - from_time: window start, in beats from the clip start.
+    - time_span: window length in beats. None = to the end of the clip.
+    - from_pitch: lowest MIDI note to clear (0-127).
+    - pitch_span: how many semitones up from from_pitch. 128 = all.
+    - arrangement: True to edit an arrangement clip instead of a session slot.
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("remove_clip_notes", {
+            "track_index": _to_zero_based(track_index, "track_index"),
+            "clip_index": _to_zero_based(clip_index, "clip_index"),
+            "from_time": from_time,
+            "time_span": time_span,
+            "from_pitch": from_pitch,
+            "pitch_span": pitch_span,
+            "arrangement": arrangement,
+        })
+        line = (
+            f"'{result.get('clip_name', '?')}' on '{result.get('track_name', '?')}': "
+            f"removed {result.get('removed', 0)} note(s), "
+            f"{result.get('notes_before', 0)} -> {result.get('notes_after', 0)}"
+        )
+        if result.get("WARNING"):
+            line += "\n  WARNING: " + result["WARNING"]
+        return line
+    except Exception as e:
+        logger.error(f"Error removing clip notes: {str(e)}")
+        return f"Error removing clip notes: {str(e)}"
+
+
+@mcp.tool()
+def delete_session_clip(ctx: Context, track_index: int, clip_index: int = 1) -> str:
+    """Empty a session clip slot.
+
+    Parameters:
+    - track_index: Track number (1-based).
+    - clip_index: Session clip slot (1-based).
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("delete_session_clip", {
+            "track_index": _to_zero_based(track_index, "track_index"),
+            "clip_index": _to_zero_based(clip_index, "clip_index"),
+        })
+        if not result.get("deleted"):
+            return (f"Slot {clip_index} of '{result.get('track_name', '?')}' "
+                    f"was already empty")
+        return (f"Deleted '{result.get('clip_name', '')}' from slot {clip_index} "
+                f"of '{result.get('track_name', '?')}'")
+    except Exception as e:
+        logger.error(f"Error deleting session clip: {str(e)}")
+        return f"Error deleting session clip: {str(e)}"
 
 
 @mcp.tool()

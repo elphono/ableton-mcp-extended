@@ -243,7 +243,8 @@ class AbletonMCP(ControlSurface):
                                  "delete_track",
                                  "set_track_volume", "set_track_panning",
                                  "create_audio_track", "create_return_track",
-                                 "set_track_state", "set_send", "set_clip_fade"]:
+                                 "set_track_state", "set_send", "set_clip_fade",
+                                 "remove_clip_notes", "delete_session_clip"]:
                 # Use a thread-safe approach with a response queue
                 response_queue = queue.Queue()
                 
@@ -324,7 +325,8 @@ class AbletonMCP(ControlSurface):
                             ti = params.get("track_index", 0)
                             pos = params.get("position", 0.0)
                             fp = params.get("file_path", "")
-                            result = self._create_arrangement_audio_clip(ti, pos, fp)
+                            warp = params.get("warp", None)
+                            result = self._create_arrangement_audio_clip(ti, pos, fp, warp)
                         elif command_type == "duplicate_to_arrangement":
                             ti = params.get("track_index", 0)
                             ci = params.get("clip_index", 0)
@@ -418,7 +420,21 @@ class AbletonMCP(ControlSurface):
                                 params.get("clip_index", 0),
                                 params.get("fade_in", 0.0),
                                 params.get("fade_out", 0.0),
-                                params.get("parameter_name", "Volume"))
+                                params.get("parameter_name", "Track Volume"),
+                                params.get("session", True))
+                        elif command_type == "remove_clip_notes":
+                            result = self._remove_clip_notes(
+                                params.get("track_index", 0),
+                                params.get("clip_index", 0),
+                                params.get("from_time", 0.0),
+                                params.get("time_span", None),
+                                params.get("from_pitch", 0),
+                                params.get("pitch_span", 128),
+                                params.get("arrangement", False))
+                        elif command_type == "delete_session_clip":
+                            result = self._delete_session_clip(
+                                params.get("track_index", 0),
+                                params.get("clip_index", 0))
 
                         # Put the result in the queue
                         response_queue.put({"status": "success", "result": result})
@@ -453,6 +469,11 @@ class AbletonMCP(ControlSurface):
                 response["result"] = self._get_sends(ti)
             elif command_type == "get_mixer_info":
                 response["result"] = self._get_mixer_info()
+            elif command_type == "get_clip_notes":
+                response["result"] = self._get_clip_notes(
+                    params.get("track_index", 0),
+                    params.get("clip_index", 0),
+                    params.get("arrangement", False))
             elif command_type == "inspect_lom":
                 response["result"] = self._inspect_lom(
                     params.get("path", ""), params.get("max_items", 200))
@@ -966,35 +987,83 @@ class AbletonMCP(ControlSurface):
             raise
 
     def _resolve_track_parameter(self, track, parameter_name):
-        """Find a mixer, send or device parameter by name on a track."""
+        """Find a mixer, send or device parameter by name on a track.
+
+        Live names the mixer parameters "Track Volume" and "Track Panning", not
+        "Volume" and "Panning" -- an exact match on the obvious name never finds
+        them, so the short names are accepted as aliases and, failing that, a
+        substring match is tried before giving up. The error lists what exists
+        rather than only saying what does not.
+        """
         mixer = track.mixer_device
-        wanted = (parameter_name or "Volume").lower()
-        for param in (mixer.volume, mixer.panning):
+        wanted = (parameter_name or "Track Volume").strip().lower()
+        aliases = {
+            "volume": "track volume",
+            "vol": "track volume",
+            "pan": "track panning",
+            "panning": "track panning",
+        }
+        wanted = aliases.get(wanted, wanted)
+
+        candidates = [mixer.volume, mixer.panning]
+        candidates.extend(mixer.sends)
+        for device in track.devices:
+            candidates.extend(device.parameters)
+
+        for param in candidates:
             if param.name.lower() == wanted:
                 return param
-        for send in mixer.sends:
-            if send.name.lower() == wanted:
-                return send
-        for device in track.devices:
-            for param in device.parameters:
-                if param.name.lower() == wanted:
-                    return param
-        raise ValueError("Parameter '{0}' not found on track '{1}'".format(
-            parameter_name, track.name))
+        for param in candidates:
+            if wanted in param.name.lower():
+                return param
+        raise ValueError(
+            "Parameter '{0}' not found on track '{1}'. Available: {2}".format(
+                parameter_name, track.name,
+                ", ".join(p.name for p in candidates[:40])))
+
+    def _resolve_session_clip(self, track_index, clip_index):
+        """Resolve a clip in a session clip slot. Returns (track, clip)."""
+        if track_index < 0 or track_index >= len(self._song.tracks):
+            raise IndexError("Track index {0} out of range (0-{1})".format(
+                track_index, len(self._song.tracks) - 1))
+        track = self._song.tracks[track_index]
+        slots = track.clip_slots
+        if clip_index < 0 or clip_index >= len(slots):
+            raise IndexError("Clip slot {0} out of range (0-{1})".format(
+                clip_index, len(slots) - 1))
+        slot = slots[clip_index]
+        if not slot.has_clip:
+            raise ValueError("Slot {0} of track '{1}' is empty".format(
+                clip_index, track.name))
+        return track, slot.clip
+
+    ARRANGEMENT_FADE_REFUSAL = (
+        "Arrangement clips cannot carry automation envelopes in Live 12.4.3: "
+        "create_automation_envelope answers 'Not a session clip'. Arrangement "
+        "automation is not writable through the LOM at all -- DeviceParameter."
+        "automation_state is read-only and nothing else writes envelope points. "
+        "Bake the fade into the audio file before importing it (ffmpeg afade), "
+        "or draw it by hand in Live."
+    )
 
     def _set_clip_fade(self, track_index, clip_index, fade_in=0.0, fade_out=0.0,
-                       parameter_name="Volume"):
-        """Draw a fade in / fade out as an automation envelope on a clip.
+                       parameter_name="Track Volume", session=True):
+        """Ramp a parameter in and/or out across a SESSION clip.
 
-        Live's LOM exposes no `fade_in_length` on arrangement clips -- the clip
-        fade handles you can drag in the UI are simply not scriptable. The only
-        way to ramp a clip in or out from a script is to write the automation
-        envelope of a parameter, by default the track volume.
+        Only session clips accept envelopes. On an arrangement clip Live raises
+        "Not a session clip", so this refuses up front with the reason and the
+        way round it, instead of letting a cryptic message surface.
+
+        The ramp ends at the parameter's *current* value, not at its maximum:
+        Track Volume runs 0.0-1.0 with unity at 0.85, so ramping to max would
+        end a fade-in 6 dB above the level the track was set to.
 
         `fade_in` and `fade_out` are durations in beats.
         """
         try:
-            track, clip = self._resolve_arrangement_clip(track_index, clip_index)
+            if not session:
+                raise ValueError(self.ARRANGEMENT_FADE_REFUSAL)
+            track, clip = self._resolve_session_clip(track_index, clip_index)
             param = self._resolve_track_parameter(track, parameter_name)
 
             clip.create_automation_envelope(param)
@@ -1009,10 +1078,10 @@ class AbletonMCP(ControlSurface):
                     "This Live version's envelope has no insert_step. "
                     "Available: " + ", ".join(available))
 
-            length = clip.end_marker - clip.start_marker
+            length = float(clip.length)
             fade_in = max(0.0, min(float(fade_in), length))
             fade_out = max(0.0, min(float(fade_out), length - fade_in))
-            top = param.max
+            top = param.value          # the level the track actually sits at
             bottom = param.min
 
             # insert_step(time, length, value) writes a constant segment; a ramp
@@ -1036,12 +1105,143 @@ class AbletonMCP(ControlSurface):
                 "track_name": track.name,
                 "clip_name": clip.name,
                 "parameter": param.name,
+                "ramps_to": top,
                 "fade_in": fade_in,
                 "fade_out": fade_out,
                 "clip_length": length,
+                "has_envelopes": self._safe_get(clip, "has_envelopes"),
             }
         except Exception as e:
             self.log_message("Error setting clip fade: " + str(e))
+            raise
+
+    # ------------------------------------------------------------------
+    # Reading and editing notes. Writing them was the only thing on offer,
+    # which is half a loop: composing means looking at what is there, fixing
+    # it and trying again. Without a read there is no way to check what was
+    # written, and without a delete a wrong note is permanent.
+    # ------------------------------------------------------------------
+
+    def _resolve_clip(self, track_index, clip_index, arrangement=False):
+        """Resolve either a session slot clip or an arrangement clip."""
+        if arrangement:
+            return self._resolve_arrangement_clip(track_index, clip_index)
+        return self._resolve_session_clip(track_index, clip_index)
+
+    def _get_clip_notes(self, track_index, clip_index, arrangement=False):
+        """List the MIDI notes of a clip.
+
+        Uses get_all_notes_extended, which carries the Live 11+ per-note fields
+        (probability, velocity_deviation) and a stable note_id. Falls back to
+        the legacy tuple API if this Live lacks it, rather than failing.
+        """
+        try:
+            track, clip = self._resolve_clip(track_index, clip_index, arrangement)
+            if not self._safe_get(clip, "is_midi_clip", False):
+                raise ValueError("Clip '{0}' is not a MIDI clip".format(clip.name))
+
+            notes = []
+            if hasattr(clip, "get_all_notes_extended"):
+                for note in clip.get_all_notes_extended():
+                    notes.append({
+                        "pitch": note.pitch,
+                        "start_time": note.start_time,
+                        "duration": note.duration,
+                        "velocity": note.velocity,
+                        "mute": note.mute,
+                        "note_id": self._safe_get(note, "note_id"),
+                        "probability": self._safe_get(note, "probability"),
+                        "velocity_deviation": self._safe_get(note, "velocity_deviation"),
+                    })
+            else:
+                for pitch, start, duration, velocity, mute in clip.get_notes(
+                        0.0, 0, clip.length, 128):
+                    notes.append({
+                        "pitch": pitch, "start_time": start, "duration": duration,
+                        "velocity": velocity, "mute": mute,
+                    })
+
+            notes.sort(key=lambda n: (n["start_time"], n["pitch"]))
+            return {
+                "track_name": track.name,
+                "clip_name": clip.name,
+                "clip_length": self._safe_get(clip, "length"),
+                "note_count": len(notes),
+                "notes": notes,
+            }
+        except Exception as e:
+            self.log_message("Error getting clip notes: " + str(e))
+            raise
+
+    def _remove_clip_notes(self, track_index, clip_index, from_time=0.0,
+                           time_span=None, from_pitch=0, pitch_span=128,
+                           arrangement=False):
+        """Remove the notes inside a time and pitch window.
+
+        Defaults clear the whole clip, which is how you replace a part: clear
+        then add. The reply reports the note count on both sides so a window
+        that matched nothing is visible instead of passing for a success.
+        """
+        try:
+            track, clip = self._resolve_clip(track_index, clip_index, arrangement)
+            if not self._safe_get(clip, "is_midi_clip", False):
+                raise ValueError("Clip '{0}' is not a MIDI clip".format(clip.name))
+
+            if time_span is None:
+                time_span = float(self._safe_get(clip, "length", 0.0)) or 0.0
+                # A clip can be looped shorter than its notes: clear generously.
+                time_span = max(time_span, float(self._safe_get(clip, "end_marker", 0.0)))
+
+            before = self._get_clip_notes(track_index, clip_index, arrangement)["note_count"]
+            if hasattr(clip, "remove_notes_extended"):
+                clip.remove_notes_extended(int(from_pitch), int(pitch_span),
+                                           float(from_time), float(time_span))
+            else:
+                clip.remove_notes(float(from_time), int(from_pitch),
+                                  float(time_span), int(pitch_span))
+            after = self._get_clip_notes(track_index, clip_index, arrangement)["note_count"]
+
+            result = {
+                "track_name": track.name,
+                "clip_name": clip.name,
+                "notes_before": before,
+                "notes_after": after,
+                "removed": before - after,
+                "window": {
+                    "from_time": from_time, "time_span": time_span,
+                    "from_pitch": from_pitch, "pitch_span": pitch_span,
+                },
+            }
+            if before and before == after:
+                result["WARNING"] = (
+                    "Nothing was removed: no note falls in this window. "
+                    "Times are in beats from the clip start."
+                )
+            return result
+        except Exception as e:
+            self.log_message("Error removing clip notes: " + str(e))
+            raise
+
+    def _delete_session_clip(self, track_index, clip_index):
+        """Empty a session clip slot."""
+        try:
+            if track_index < 0 or track_index >= len(self._song.tracks):
+                raise IndexError("Track index {0} out of range (0-{1})".format(
+                    track_index, len(self._song.tracks) - 1))
+            track = self._song.tracks[track_index]
+            if clip_index < 0 or clip_index >= len(track.clip_slots):
+                raise IndexError("Clip slot {0} out of range (0-{1})".format(
+                    clip_index, len(track.clip_slots) - 1))
+            slot = track.clip_slots[clip_index]
+            if not slot.has_clip:
+                return {"track_name": track.name, "slot": clip_index,
+                        "deleted": False, "note": "slot was already empty"}
+            name = slot.clip.name
+            slot.delete_clip()
+            return {"track_name": track.name, "slot": clip_index,
+                    "deleted": True, "clip_name": name}
+        except Exception as e:
+            self.log_message("Error deleting session clip: " + str(e))
             raise
 
     def _inspect_lom(self, path, max_items=200):
@@ -1466,16 +1666,45 @@ class AbletonMCP(ControlSurface):
             
             # Select the track
             self._song.view.selected_track = track
-            
+
+            # The caller wants to know what actually landed on the track, so
+            # take the device list on both sides of the load. Without this the
+            # reply claimed "Devices on track:" and then listed nothing, which
+            # reads like a failure after a load that in fact worked.
+            before = [d.name for d in track.devices]
+
             # Load the item
             app.browser.load_item(item)
-            
+
+            after = [d.name for d in track.devices]
+
+            # Multiset difference, not a tail slice: an instrument is inserted
+            # ahead of the audio effects already on the track, so the new
+            # device is not necessarily the last one.
+            remaining = list(before)
+            new_devices = []
+            for name in after:
+                if name in remaining:
+                    remaining.remove(name)
+                else:
+                    new_devices.append(name)
+
             result = {
                 "loaded": True,
                 "item_name": item.name,
                 "track_name": track.name,
-                "uri": item_uri
+                "uri": item_uri,
+                "devices_before": before,
+                "devices_after": after,
+                "new_devices": new_devices,
             }
+            if not new_devices:
+                # Live may not have committed the load by the time this returns.
+                # Say so rather than let an empty list read as a failure.
+                result["note"] = (
+                    "Device list unchanged in this reply -- Live may not have "
+                    "committed the load yet. Check with get_track_info."
+                )
             return result
         except Exception as e:
             self.log_message("Error loading browser item: {0}".format(str(e)))
@@ -1692,8 +1921,49 @@ class AbletonMCP(ControlSurface):
             self.log_message("Error creating arrangement clip: " + str(e))
             raise
 
-    def _create_arrangement_audio_clip(self, track_index, position, file_path):
-        """Create audio clip in arrangement from file."""
+    def _measure_stretch(self, clip):
+        """Compare a clip's played duration with its file's real duration.
+
+        Live warps imported audio by default, which silently time-stretches it
+        to the grid: a 15.085 s file became 16.000 s at 120 BPM, i.e. +6.1 %.
+        Nothing in the API says so -- the clip merely reports a round length in
+        beats. Under a video where the singer's lips must match, that stretch
+        is fatal, so every import reports it.
+
+        `sample_length / sample_rate` is the *decoded* duration, which is the
+        one that matters; ffprobe reports the container duration, and for mp3
+        the two differ by the decoder padding.
+        """
+        info = {}
+        try:
+            rate = clip.sample_rate
+            if not rate:
+                return info
+            file_seconds = clip.sample_length / float(rate)
+            clip_seconds = (clip.end_time - clip.start_time) * 60.0 / self._song.tempo
+            info["file_seconds"] = round(file_seconds, 4)
+            info["clip_seconds"] = round(clip_seconds, 4)
+            info["warping"] = clip.warping
+            if file_seconds > 0:
+                percent = (clip_seconds / file_seconds - 1.0) * 100.0
+                info["stretch_percent"] = round(percent, 3)
+                if abs(percent) > 0.1:
+                    info["WARNING"] = (
+                        "Live stretched this clip by {0:+.2f}% by warping it. "
+                        "Set warping=False to play it at its true speed."
+                    ).format(percent)
+        except Exception as e:
+            info["stretch_error"] = str(e)
+        return info
+
+    def _create_arrangement_audio_clip(self, track_index, position, file_path,
+                                       warp=None):
+        """Create audio clip in arrangement from file.
+
+        `warp=False` disables warping right after the import, which is what
+        montage against picture needs: warping stretches the audio to the grid.
+        `warp=None` leaves Live's own default (which is to warp).
+        """
         try:
             if track_index < 0 or track_index >= len(self._song.tracks):
                 raise IndexError("Track index out of range")
@@ -1704,7 +1974,10 @@ class AbletonMCP(ControlSurface):
             result = {"start_time": position, "file_path": file_path, "is_audio": True}
             for clip in track.arrangement_clips:
                 if abs(clip.start_time - position) < 0.01:
+                    if warp is not None:
+                        clip.warping = bool(warp)
                     result = self._get_arrangement_clip_info(clip)
+                    result.update(self._measure_stretch(clip))
                     break
             return result
         except Exception as e:
@@ -1766,24 +2039,61 @@ class AbletonMCP(ControlSurface):
             self.log_message("Error deleting arrangement clip: " + str(e))
             raise
 
+    # Properties that Live accepts and reads back unchanged while doing nothing
+    # observable to an arrangement clip. Measured on 12.4.3, not assumed:
+    #   end_marker = 10.0   -> accepted, reads back 10.0, `length` unchanged
+    #   start_marker = 4.0  -> reads back 0.0, silently refused
+    #   position = 16.0     -> moves the loop brace inside the sample, not the
+    #                          clip in the arrangement
+    # Trimming an arrangement clip is simply not in this version's API: cut the
+    # extract upstream (ffmpeg) and import it already the right length.
+    INERT_ON_ARRANGEMENT = ("start_marker", "end_marker", "position")
+
     def _set_arrangement_clip_property(self, track_index, clip_index, property_name, value):
-        """Set a property on an arrangement clip."""
+        """Set a property on an arrangement clip, and report what really moved.
+
+        Returning the observable consequences (extent, loop, warping) is the
+        point: several properties are accepted and read back unchanged while
+        having no effect at all, and a bare echo of the value written would
+        hide that.
+        """
         try:
             ALLOWED = ("name", "muted", "color", "looping", "loop_start", "loop_end",
                        "gain", "pitch_coarse", "pitch_fine", "warping", "warp_mode",
-                       # Montage : rogner l'extrait joue dans le sample, poser
-                       # les fondus d'entree/sortie, deplacer le clip.
-                       "start_marker", "end_marker", "position",
-                       "fade_in_length", "fade_out_length",
-                       "start_time", "end_time",
                        "velocity_amount", "signature_numerator",
-                       "signature_denominator")
+                       "signature_denominator",
+                       # Kept reachable, but they lie -- see INERT_ON_ARRANGEMENT.
+                       "start_marker", "end_marker", "position",
+                       # These raise, which is honest: read-only or absent.
+                       "start_time", "end_time",
+                       "fade_in_length", "fade_out_length")
             if property_name not in ALLOWED:
                 raise ValueError("Property '{0}' not allowed. Allowed: {1}".format(
                     property_name, ", ".join(ALLOWED)))
             track, clip = self._resolve_arrangement_clip(track_index, clip_index)
+
+            before = (self._safe_get(clip, "start_time"), self._safe_get(clip, "end_time"))
             setattr(clip, property_name, value)
-            return {"property": property_name, "value": getattr(clip, property_name)}
+            after = (self._safe_get(clip, "start_time"), self._safe_get(clip, "end_time"))
+
+            result = {
+                "property": property_name,
+                "written": value,
+                "reads_back": self._safe_get(clip, property_name),
+                "start_time": after[0],
+                "end_time": after[1],
+                "extent_beats": (after[1] - after[0]) if None not in after else None,
+                "loop_length_beats": self._safe_get(clip, "length"),
+                "looping": self._safe_get(clip, "looping"),
+                "warping": self._safe_get(clip, "warping"),
+            }
+            if property_name in self.INERT_ON_ARRANGEMENT and before == after:
+                result["WARNING"] = (
+                    "'{0}' changed nothing on this arrangement clip. Live accepts "
+                    "it and reads it back, but the clip's extent is unchanged. "
+                    "Trim the extract before importing it instead."
+                ).format(property_name)
+            return result
         except Exception as e:
             self.log_message("Error setting arrangement clip property: " + str(e))
             raise
@@ -1830,38 +2140,18 @@ class AbletonMCP(ControlSurface):
             raise
 
     def _manage_clip_automation(self, track_index, clip_index, action, parameter_name=""):
-        """Create or clear automation envelopes."""
+        """Create or clear automation envelopes on a SESSION clip.
+
+        This resolved an *arrangement* clip upstream, which made it dead code:
+        arrangement clips reject every envelope call with "Not a session clip",
+        so it could never succeed whatever it was given.
+        """
         try:
-            track, clip = self._resolve_arrangement_clip(track_index, clip_index)
+            track, clip = self._resolve_session_clip(track_index, clip_index)
             if action == "clear_all":
                 clip.clear_all_envelopes()
                 return {"action": "clear_all", "done": True}
-            # Find the parameter
-            param = None
-            # Check mixer device first
-            mixer = track.mixer_device
-            for p in [mixer.volume, mixer.panning]:
-                if p.name.lower() == parameter_name.lower():
-                    param = p
-                    break
-            # Check sends
-            if param is None:
-                for send in mixer.sends:
-                    if send.name.lower() == parameter_name.lower():
-                        param = send
-                        break
-            # Check track devices
-            if param is None:
-                for device in track.devices:
-                    for p in device.parameters:
-                        if p.name.lower() == parameter_name.lower():
-                            param = p
-                            break
-                    if param:
-                        break
-            if param is None:
-                raise ValueError("Parameter '{0}' not found on track '{1}'".format(
-                    parameter_name, track.name))
+            param = self._resolve_track_parameter(track, parameter_name)
             if action == "create":
                 clip.create_automation_envelope(param)
                 return {"action": "create", "parameter": param.name, "done": True}
