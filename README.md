@@ -17,6 +17,7 @@
 > | `run_server.bat` — Windows launcher, UTF-8 forced for accented track names | |
 >
 > Custom tools index tracks `1..n`, returns `n+1..n+r`, and **`0` = master**.
+
 **Control Ableton Live using natural language via AI assistants like Claude or Cursor. This project provides a robust Model Context Protocol (MCP) server that translates natural language commands into precise actions within your Ableton Live session.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
