@@ -1,4 +1,21 @@
 # Ableton MCP Extended
+
+> ### About this fork
+>
+> Fork of [uisato/ableton-mcp-extended](https://github.com/uisato/ableton-mcp-extended),
+> maintained alongside **[elphono/live-sidekick](https://github.com/elphono/live-sidekick)**
+> (WSL2 tooling and a measured map of the Live 12 API). Tested on Live 12.4.3, Windows + WSL2.
+>
+> | Adds | Fixes (tools that reported success while doing nothing) |
+> |---|---|
+> | `create_audio_track`, `create_return_track` | `create_arrangement_audio_clip`: takes `warp`, measures the real stretch in a second round-trip |
+> | `set_track_state` (mute / solo / arm), `get_sends` / `set_send` | `set_arrangement_clip_property`: reports observable consequences, flags inert properties |
+> | `get_mixer_info` — full mixer snapshot in one call | `manage_clip_automation`: targeted arrangement clips, which Live refuses — now session slots |
+> | `inspect_lom` — runtime introspection of the Live Object Model | `load_instrument_or_effect`: listed no devices after a successful load |
+> | `get_clip_notes`, `remove_clip_notes`, `delete_session_clip` | `pyproject.toml`: non-existent `AbletonMCP_UDP` package, `mcp` pinned below 2.x |
+> | `set_clip_fade` (session clips), `measure_arrangement_clip` | `run_server.bat`: paths relative to the script, UTF-8 forced for accented track names |
+>
+> Custom tools index tracks `1..n`, returns `n+1..n+r`, and **`0` = master**.
 **Control Ableton Live using natural language via AI assistants like Claude or Cursor. This project provides a robust Model Context Protocol (MCP) server that translates natural language commands into precise actions within your Ableton Live session.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
