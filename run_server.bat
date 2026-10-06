@@ -8,5 +8,6 @@ chcp 65001 > NUL 2>&1
 set PYTHONUTF8=1
 set PYTHONIOENCODING=utf-8
 set PYTHONUNBUFFERED=1
-cd /d C:\Users\elphono\dev\ableton-mcp
-"C:\Users\elphono\dev\ableton-mcp\.venv\Scripts\python.exe" -X utf8 -m MCP_Server.server
+REM %~dp0 = dossier de ce .bat : aucun chemin propre a une machine.
+cd /d "%~dp0"
+"%~dp0.venv\Scripts\python.exe" -X utf8 -m MCP_Server.server
